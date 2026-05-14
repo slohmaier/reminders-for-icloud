@@ -10,6 +10,7 @@
     <AssemblyName>RemindersForICloud</AssemblyName>
     <RootNamespace>RemindersForICloud</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
     <Version>0.1.0</Version>
     <Product>Reminders for iCloud</Product>
     <Description>Accessible Windows wrapper for iCloud Reminders web app</Description>
@@ -19,6 +20,10 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3967.48" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="icon.ico" />
   </ItemGroup>
 
 </Project>
