@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Input;
 using Microsoft.Web.WebView2.Core;
@@ -19,24 +20,44 @@ public partial class MainWindow : Window
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
-        var userDataFolder = Path.Combine(
+        var dataRoot = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "RemindersForICloud",
-            "WebView2Data");
+            "RemindersForICloud");
+        var userDataFolder = Path.Combine(dataRoot, "WebView2Data");
+        var logPath = Path.Combine(dataRoot, "diagnostic.log");
         Directory.CreateDirectory(userDataFolder);
 
-        var env = await CoreWebView2Environment.CreateAsync(
-            browserExecutableFolder: null,
-            userDataFolder: userDataFolder);
+        var options = new CoreWebView2EnvironmentOptions
+        {
+            // Force Chromium to emit the full accessibility tree on every
+            // renderer. Without this, embedded WebView2 lazily builds the
+            // tree only when a UIA client connects, which breaks iCloud's
+            // ARIA grid / listbox keyboard navigation (arrow up/down does
+            // not move between rows in the notes and reminders lists).
+            AdditionalBrowserArguments = "--force-renderer-accessibility=complete",
+        };
 
+        var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder, options);
         await WebView.EnsureCoreWebView2Async(env);
 
         var core = WebView.CoreWebView2;
         core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Dark;
-        core.Settings.AreDevToolsEnabled = false;
+        core.Settings.AreDevToolsEnabled = true;
         core.Settings.AreDefaultContextMenusEnabled = true;
         core.Settings.IsStatusBarEnabled = false;
-        core.Settings.UserAgent = core.Settings.UserAgent;
+
+        // Strip the optional "WebView2/X.Y.Z.W" segment that some Edge
+        // versions append to the UA string. iCloud (and other UA-sniffing
+        // sites) then sees us as plain stable Edge.
+        var originalUa = core.Settings.UserAgent;
+        var cleanedUa = Regex.Replace(
+            originalUa,
+            @"\s+WebView2/\S+",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+        core.Settings.UserAgent = cleanedUa;
+
+        TryWriteDiagnostic(logPath, originalUa, cleanedUa);
 
         core.NewWindowRequested += (s, args) =>
         {
@@ -60,6 +81,26 @@ public partial class MainWindow : Window
 
         WebView.Source = new Uri(TargetUrl);
         WebView.Focus();
+    }
+
+    private static void TryWriteDiagnostic(string logPath, string originalUa, string effectiveUa)
+    {
+        try
+        {
+            var lines = new[]
+            {
+                $"== {DateTime.UtcNow:O} ==",
+                $"original UA : {originalUa}",
+                $"effective UA: {effectiveUa}",
+                $"target URL  : {TargetUrl}",
+                ""
+            };
+            File.AppendAllLines(logPath, lines);
+        }
+        catch
+        {
+            // Diagnostic logging must never affect app startup.
+        }
     }
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
