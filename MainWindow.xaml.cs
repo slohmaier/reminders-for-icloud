@@ -11,6 +11,11 @@ public partial class MainWindow : Window
 {
     private const string TargetUrl = "https://www.icloud.com/reminders";
 
+    private static readonly string DataRoot = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "RemindersForICloud");
+    private static readonly string LogPath = Path.Combine(DataRoot, "diagnostic.log");
+
     public MainWindow()
     {
         InitializeComponent();
@@ -20,20 +25,15 @@ public partial class MainWindow : Window
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
-        var dataRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "RemindersForICloud");
-        var userDataFolder = Path.Combine(dataRoot, "WebView2Data");
-        var logPath = Path.Combine(dataRoot, "diagnostic.log");
+        var userDataFolder = Path.Combine(DataRoot, "WebView2Data");
         Directory.CreateDirectory(userDataFolder);
 
         var options = new CoreWebView2EnvironmentOptions
         {
-            // Force Chromium to emit the full accessibility tree on every
-            // renderer. Without this, embedded WebView2 lazily builds the
-            // tree only when a UIA client connects, which breaks iCloud's
-            // ARIA grid / listbox keyboard navigation (arrow up/down does
-            // not move between rows in the notes and reminders lists).
+            // Force Chromium to build the renderer accessibility tree on
+            // every process, regardless of whether we can detect a UIA
+            // client at startup. Without this, iCloud's ARIA grids/lists
+            // never fully wire up arrow-key navigation.
             AdditionalBrowserArguments = "--force-renderer-accessibility=complete",
         };
 
@@ -46,9 +46,7 @@ public partial class MainWindow : Window
         core.Settings.AreDefaultContextMenusEnabled = true;
         core.Settings.IsStatusBarEnabled = false;
 
-        // Strip the optional "WebView2/X.Y.Z.W" segment that some Edge
-        // versions append to the UA string. iCloud (and other UA-sniffing
-        // sites) then sees us as plain stable Edge.
+        // (1) UA string: strip "WebView2/x.y.z" segment.
         var originalUa = core.Settings.UserAgent;
         var cleanedUa = Regex.Replace(
             originalUa,
@@ -57,7 +55,25 @@ public partial class MainWindow : Window
             RegexOptions.IgnoreCase).Trim();
         core.Settings.UserAgent = cleanedUa;
 
-        TryWriteDiagnostic(logPath, originalUa, cleanedUa);
+        // (2) UA Client Hints: rewrite the `Sec-CH-UA` brand list on every
+        // outgoing request so iCloud sees us as "Microsoft Edge", not
+        // "Microsoft Edge WebView2". This is the more likely cause of the
+        // ARIA list/grid keyboard navigation regression.
+        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+        core.WebResourceRequested += RewriteClientHints;
+
+        // (3) Diagnostic JS — captures what iCloud actually sees and posts
+        // it back via chrome.webview.postMessage so we can log it.
+        core.WebMessageReceived += OnDiagnosticMessage;
+        try
+        {
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(DiagnosticScript);
+        }
+        catch { }
+
+        TryWriteDiagnostic($"original UA : {originalUa}");
+        TryWriteDiagnostic($"effective UA: {cleanedUa}");
+        TryWriteDiagnostic($"target URL  : {TargetUrl}");
 
         core.NewWindowRequested += (s, args) =>
         {
@@ -83,24 +99,95 @@ public partial class MainWindow : Window
         WebView.Focus();
     }
 
-    private static void TryWriteDiagnostic(string logPath, string originalUa, string effectiveUa)
+    private static void RewriteClientHints(object? sender, CoreWebView2WebResourceRequestedEventArgs args)
     {
         try
         {
-            var lines = new[]
+            var headers = args.Request.Headers;
+            foreach (var name in new[] { "Sec-CH-UA", "Sec-CH-UA-Full-Version-List" })
             {
-                $"== {DateTime.UtcNow:O} ==",
-                $"original UA : {originalUa}",
-                $"effective UA: {effectiveUa}",
-                $"target URL  : {TargetUrl}",
-                ""
-            };
-            File.AppendAllLines(logPath, lines);
+                if (!headers.Contains(name)) continue;
+                var value = headers.GetHeader(name);
+                var renamed = value.Replace(
+                    "\"Microsoft Edge WebView2\"",
+                    "\"Microsoft Edge\"",
+                    StringComparison.Ordinal);
+                if (!ReferenceEquals(renamed, value))
+                {
+                    headers.SetHeader(name, renamed);
+                }
+            }
         }
         catch
         {
-            // Diagnostic logging must never affect app startup.
+            // Header rewriting must never break the request.
         }
+    }
+
+    private const string DiagnosticScript = @"
+        (function () {
+            if (window.__icloudWrapperDiag) return;
+            window.__icloudWrapperDiag = true;
+            function snapshot() {
+                try {
+                    var brands = null;
+                    if (navigator.userAgentData && navigator.userAgentData.brands) {
+                        brands = navigator.userAgentData.brands.map(function (b) {
+                            return b.brand + '/' + b.version;
+                        }).join(', ');
+                    }
+                    var probe = null;
+                    var sel = '[role=""row""], [role=""option""], [role=""listitem""], [role=""gridcell""]';
+                    var first = document.querySelector(sel);
+                    if (first) {
+                        probe = {
+                            tag: first.tagName,
+                            role: first.getAttribute('role'),
+                            ariaLabel: first.getAttribute('aria-label'),
+                            ariaSelected: first.getAttribute('aria-selected'),
+                            parentRole: first.parentElement && first.parentElement.getAttribute('role'),
+                        };
+                    }
+                    var msg = {
+                        type: 'diag',
+                        url: location.href,
+                        ua: navigator.userAgent,
+                        brands: brands,
+                        readyState: document.readyState,
+                        firstRow: probe,
+                    };
+                    window.chrome.webview.postMessage(msg);
+                } catch (e) {
+                    try {
+                        window.chrome.webview.postMessage({ type: 'diag-error', err: String(e) });
+                    } catch (_) {}
+                }
+            }
+            window.addEventListener('load', function () { setTimeout(snapshot, 1500); });
+            setTimeout(snapshot, 8000);
+        })();
+    ";
+
+    private void OnDiagnosticMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs args)
+    {
+        try
+        {
+            var json = args.TryGetWebMessageAsString() ?? args.WebMessageAsJson;
+            TryWriteDiagnostic($"[js] {json}");
+        }
+        catch
+        {
+            // Diagnostics must never affect the app.
+        }
+    }
+
+    private static void TryWriteDiagnostic(string line)
+    {
+        try
+        {
+            File.AppendAllLines(LogPath, new[] { $"{DateTime.UtcNow:O} {line}" });
+        }
+        catch { }
     }
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
