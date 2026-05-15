@@ -1,48 +1,65 @@
 # Reminders for iCloud
 
-A small, accessible Windows wrapper around the iCloud Reminders web app
-(<https://www.icloud.com/reminders>). It opens the iCloud Reminders web
-interface in a native Windows window with a stable title bar, dark mode, and
-full screen reader (NVDA, Narrator, JAWS) support via WebView2.
+A tiny Windows launcher that opens the iCloud Reminders web app
+(<https://www.icloud.com/reminders>) in **Microsoft Edge "app mode"**
+(`msedge.exe --app=...`) with its own isolated user profile.
 
-**Not affiliated with Apple Inc.** iCloud is a registered trademark of Apple Inc.
-This project is an independent, open-source convenience wrapper for the public
-iCloud web app and does not modify, redistribute, or reverse-engineer any
-Apple software.
+You get a dedicated, taskbar-separate window for iCloud Reminders — but
+the underlying browser is real Edge, so all the accessibility, keyboard
+navigation, and screen-reader behaviour you already trust in Edge applies
+1:1 here.
 
-## Why this exists
+**Not affiliated with Apple Inc.** iCloud is a registered trademark of
+Apple Inc. This project is an independent, open-source convenience
+launcher for the public iCloud web app and does not modify, redistribute,
+or reverse-engineer any Apple software.
 
-The iCloud Reminders web app already works well with screen readers, but
-living inside a browser tab has downsides for daily use:
+## Why a launcher, not an embedded webview?
 
-- it gets lost among other tabs,
-- it doesn't have its own taskbar/Alt-Tab entry,
-- a stray Ctrl+W kills it,
-- browser chrome adds clutter to the screen reader's reading order.
+The first iteration of this project embedded iCloud Reminders in a
+WebView2 control inside a WPF window. WebView2 *is* the Edge engine, but
+iCloud's single-page app serves a different (and noticeably less
+accessible) code path when it detects an embedded WebView2 host — arrow-
+key navigation inside the reminders grid, in particular, silently breaks
+even after aggressive UA / UA-CH / brand spoofing. Rather than chase an
+undocumented detection vector forever, this launcher just *is* Edge: the
+only reliable fix.
 
-This wrapper gives iCloud Reminders its own dedicated, single-instance
-application window with the bare minimum of native chrome.
+## What the launcher does
+
+1. Locates `msedge.exe` via `HKLM/HKCU\…\App Paths\msedge.exe` and the
+   standard install locations.
+2. Creates a dedicated profile directory at
+   `%LOCALAPPDATA%\RemindersForICloud\EdgeProfile`.
+3. Spawns Edge as:
+   ```
+   msedge.exe --app=https://www.icloud.com/reminders
+              --user-data-dir=%LOCALAPPDATA%\RemindersForICloud\EdgeProfile
+              --no-first-run
+              --no-default-browser-check
+   ```
+4. Exits. Edge owns the window from here on.
+
+A short cross-process mutex around the launch coalesces fast double-clicks
+so you don't end up with two parallel Edge windows on accident.
 
 ## Features
 
-- Native Win32 window — proper UIA tree, screen-reader-friendly.
-- Dark mode by default (via WebView2 `PreferredColorScheme`).
-- Persistent login — cookies/storage live in
-  `%LOCALAPPDATA%\RemindersForICloud\WebView2Data`.
-- Single instance — launching twice just keeps the first window.
-- External links open in your default browser instead of inside the app.
-- Keyboard:
-  - **F5** — reload
-  - **Alt+Home** — back to `icloud.com/reminders`
-  - All other keys go to the iCloud web app unchanged.
+- **Native Edge window** — same chrome as a Progressive Web App: minimal
+  title bar, no URL bar, taskbar entry distinct from regular Edge.
+- **Persistent login** — your iCloud session lives in the dedicated profile
+  folder and survives reboots. Apple's 2FA "trust this browser" cookie
+  applies, so you re-authenticate roughly every 30 days.
+- **Full Edge accessibility** — screen readers, keyboard navigation,
+  high-contrast, dark mode all behave exactly as in standalone Edge.
 
 ## Requirements
 
 - Windows 10 1809+ or Windows 11
-- [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
-  (preinstalled on Windows 11)
-- .NET 10 Runtime (for framework-dependent builds) — the released `.exe`
-  ships self-contained, so end users do not need .NET installed.
+- Microsoft Edge installed (the Edge Stable channel; preinstalled on
+  Windows 11).
+- .NET 10 Runtime — the released `.exe` ships self-contained, so end users
+  do not need .NET installed.
 
 ## Building
 
@@ -58,20 +75,13 @@ dotnet publish -c Release -r win-x64 --self-contained `
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
 
-The output lands in `bin\Release\net10.0-windows\win-x64\publish\`.
+Output goes to `bin\Release\net10.0-windows\win-x64\publish\RemindersForICloud.exe`.
 
 ## Accessibility
 
-This project treats screen-reader compatibility as a hard requirement, not a
-polish item. The wrapper itself:
-
-- exposes a meaningful UIA name on the window and the embedded WebView2 control,
-- uses the native Windows title bar (no custom HTML chrome),
-- forces dark mode in the embedded web app,
-- does not intercept Tab, Shift+Tab, Alt+F4, or any other navigation key.
-
-The accessibility of the iCloud Reminders interface itself is Apple's
-responsibility. If you find regressions, please report them to Apple as well.
+Because we shell out to Edge, accessibility is whatever Edge supports —
+which is everything Stefan's blind workflow already relies on: NVDA,
+keyboard navigation in Apple's ARIA grids, dark mode, focus management.
 
 ## License
 
