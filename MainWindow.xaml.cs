@@ -62,8 +62,23 @@ public partial class MainWindow : Window
         core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
         core.WebResourceRequested += RewriteClientHints;
 
-        // (3) Diagnostic JS — captures what iCloud actually sees and posts
-        // it back via chrome.webview.postMessage so we can log it.
+        // (3) Brand spoof: override navigator.userAgentData *inside the
+        // page* so iCloud's client-side detection sees "Microsoft Edge"
+        // instead of "Microsoft Edge WebView2". Must run before iCloud's
+        // own scripts — AddScriptToExecuteOnDocumentCreatedAsync does
+        // exactly that. This is the actual fix for the list-navigation
+        // regression; the network-header rewrite above only spoofed what
+        // the server sees, but iCloud's SPA reads navigator.userAgentData
+        // locally to decide whether to wire up the ARIA grid keyboard
+        // handlers.
+        try
+        {
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(BrandSpoofScript);
+        }
+        catch { }
+
+        // (4) Diagnostic JS — captures what iCloud actually sees *after*
+        // our spoofing, and posts it back via chrome.webview.postMessage.
         core.WebMessageReceived += OnDiagnosticMessage;
         try
         {
@@ -123,6 +138,59 @@ public partial class MainWindow : Window
             // Header rewriting must never break the request.
         }
     }
+
+    // Runs at document-creation time, before any page scripts. Replaces the
+    // "Microsoft Edge WebView2" brand in navigator.userAgentData with plain
+    // "Microsoft Edge", both for the low-entropy `brands` property and the
+    // high-entropy getHighEntropyValues() Promise (which iCloud's SPA may
+    // use for fingerprinting). Version numbers are preserved verbatim so
+    // the result remains a believable Edge build.
+    private const string BrandSpoofScript = @"
+        (function () {
+            try {
+                var orig = navigator.userAgentData;
+                if (!orig || !Array.isArray(orig.brands)) return;
+                function rename(b) {
+                    return b && b.brand === 'Microsoft Edge WebView2'
+                        ? { brand: 'Microsoft Edge', version: b.version }
+                        : b;
+                }
+                var newBrands = orig.brands.map(rename);
+                var origGetHigh = typeof orig.getHighEntropyValues === 'function'
+                    ? orig.getHighEntropyValues.bind(orig)
+                    : null;
+                var spoof = {
+                    brands: newBrands,
+                    mobile: orig.mobile,
+                    platform: orig.platform,
+                    getHighEntropyValues: function (hints) {
+                        if (!origGetHigh) {
+                            return Promise.resolve({
+                                brands: newBrands,
+                                mobile: orig.mobile,
+                                platform: orig.platform,
+                            });
+                        }
+                        return origGetHigh(hints).then(function (r) {
+                            if (Array.isArray(r.brands)) r.brands = r.brands.map(rename);
+                            if (Array.isArray(r.fullVersionList)) r.fullVersionList = r.fullVersionList.map(rename);
+                            return r;
+                        });
+                    },
+                    toJSON: function () {
+                        return { brands: newBrands, mobile: orig.mobile, platform: orig.platform };
+                    },
+                };
+                Object.defineProperty(navigator, 'userAgentData', {
+                    value: spoof,
+                    writable: false,
+                    configurable: true,
+                });
+            } catch (e) {
+                // Spoofing must never break the page.
+            }
+        })();
+    ";
 
     private const string DiagnosticScript = @"
         (function () {
